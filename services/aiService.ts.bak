@@ -1,0 +1,231 @@
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { DetectedAnomaly } from '@/types';
+import Constants from 'expo-constants';
+import * as tf from '@tensorflow/tfjs';
+import '@tensorflow/tfjs-backend-webgl';
+import * as FileSystem from 'expo-file-system';
+import { Platform } from 'react-native';
+import { decode } from 'jpeg-js';
+
+const genAI = new GoogleGenerativeAI(
+  Constants.expoConfig?.extra?.EXPO_PUBLIC_GEMINI_API_KEY ||
+  process.env.EXPO_PUBLIC_GEMINI_API_KEY || ''
+);
+
+let model: tf.LayersModel | null = null;
+
+const MODEL_PATH = '../assets/models/mobilenetv2_finetune_best.h5';
+const IMAGE_SIZE = 224; // MobileNetV2 default input size
+const NUM_CHANNELS = 3;
+
+const initializeModel = async () => {
+  if (!model) {
+    await tf.ready();
+    try {
+      model = await tf.loadLayersModel(`file://${MODEL_PATH}`);
+      console.log('MobileNetV2 model loaded successfully');
+    } catch (error) {
+      console.error('Error loading model:', error);
+      throw new Error('Failed to load AI model');
+    }
+  }
+  return model;
+};
+
+const preprocessImage = async (tensor: tf.Tensor3D): Promise<tf.Tensor4D> => {
+  try {
+    // Resize the image to match the model's expected input size
+    const resized = tf.image.resizeBilinear(tensor, [IMAGE_SIZE, IMAGE_SIZE]);
+    
+    // Normalize pixel values to [0, 1]
+    const normalized = tf.div(resized, 255.0);
+    
+    // Add batch dimension
+    const batched = tf.expandDims(normalized, 0);
+    
+    return batched;
+  } catch (error) {
+    console.error('Error preprocessing image:', error);
+    throw error;
+  }
+};
+
+const imageToTensor = async (imageUri: string): Promise<tf.Tensor3D> => {
+  try {
+    if (Platform.OS === 'web') {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => {
+          const tensor = tf.browser.fromPixels(img);
+          resolve(tensor);
+        };
+        img.onerror = reject;
+        img.src = imageUri;
+      });
+    } else {
+      const imageBase64 = await FileSystem.readAsStringAsync(imageUri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+
+      const imageBuffer = Uint8Array.from(atob(imageBase64), c => c.charCodeAt(0));
+      const rawImageData = decode(imageBuffer, { useTArray: true });
+
+      const { width, height, data } = rawImageData;
+      const buffer = new Uint8Array(width * height * 3);
+      let offset = 0;
+
+      for (let i = 0; i < data.length; i += 4) {
+        buffer[offset++] = data[i];
+        buffer[offset++] = data[i + 1];
+        buffer[offset++] = data[i + 2];
+      }
+
+      return tf.tensor3d(buffer, [height, width, 3]);
+    }
+  } catch (error) {
+    console.error('Error converting image to tensor:', error);
+    throw error;
+  }
+};
+
+const ANOMALY_CLASSES = [
+  'Normal',
+  'COVID-19',
+  'Viral Pneumonia',
+  'Bacterial Pneumonia'
+] as const;
+
+type AnomalyClass = typeof ANOMALY_CLASSES[number];
+
+const ANOMALY_CLASSES = [
+  'Normal',
+  'COVID-19',
+  'Viral Pneumonia',
+  'Bacterial Pneumonia'
+] as const;
+
+type AnomalyClass = typeof ANOMALY_CLASSES[number];
+
+const LOCATIONS_MAP: Record<AnomalyClass, string[]> = {
+  'COVID-19': [
+    'Bilateral peripheral ground-glass opacities',
+    'Lower lung zones',
+    'Multiple lung zones'
+  ],
+  'Viral Pneumonia': [
+    'Interstitial pattern',
+    'Bronchial walls',
+    'Perihilar region'
+  ],
+  'Bacterial Pneumonia': [
+    'Lobar consolidation',
+    'Air bronchograms',
+    'Single lung zone'
+  ],
+  'Normal': [
+    'Clear lung fields',
+    'Normal cardiac silhouette',
+    'Clear costophrenic angles'
+  ]
+};
+
+const DESCRIPTIONS_MAP: Record<AnomalyClass, string> = {
+  'COVID-19': 'Pattern suggestive of COVID-19 infection with characteristic peripheral ground-glass opacities. Findings are bilateral and predominantly in lower zones.',
+  'Viral Pneumonia': 'Features consistent with viral pneumonia showing diffuse interstitial pattern and bronchial wall thickening.',
+  'Bacterial Pneumonia': 'Radiographic findings indicate bacterial pneumonia with lobar consolidation and air bronchograms.',
+  'Normal': 'No significant abnormalities detected. Lung fields are clear with normal cardiac silhouette and costophrenic angles.'
+};
+
+export const detectAnomalies = async (imageUri: string): Promise<DetectedAnomaly[]> => {
+  try {
+    await initializeModel();
+
+    if (!model) {
+      throw new Error('Model failed to initialize');
+    }
+
+    const imageTensor = await imageToTensor(imageUri);
+    const preprocessedImage = await preprocessImage(imageTensor);
+    
+    // Run inference
+    const predictions = await model.predict(preprocessedImage) as tf.Tensor;
+    const probabilities = await predictions.data();
+
+    // Clean up tensors
+    imageTensor.dispose();
+    preprocessedImage.dispose();
+    predictions.dispose();
+
+    // Get the top prediction
+    let maxProb = 0;
+    let predictedClass = 0;
+    for (let i = 0; i < probabilities.length; i++) {
+      if (probabilities[i] > maxProb) {
+        maxProb = probabilities[i];
+        predictedClass = i;
+      }
+    }
+
+    const className = ANOMALY_CLASSES[predictedClass] as AnomalyClass;
+    const locations = LOCATIONS_MAP[className];
+    
+    if (className === 'Normal') {
+      return [{
+        type: 'Normal',
+        location: locations[0],
+        confidence: maxProb,
+        description: DESCRIPTIONS_MAP[className]
+      }];
+    }
+
+    // For abnormal findings, create multiple anomalies based on the different locations
+    const anomalies: DetectedAnomaly[] = locations.map((location, index) => ({
+      type: className,
+      location: location,
+      confidence: maxProb * (1 - index * 0.1), // Slightly decrease confidence for secondary locations
+      description: index === 0 ? DESCRIPTIONS_MAP[className] : `Additional ${className} findings in this region.`
+    }));
+
+    return anomalies;
+  } catch (error) {
+    console.error('Error detecting anomalies:', error);
+    throw new Error('Failed to analyze X-ray image. Please try again.');
+  }
+
+    return anomalies;
+  } catch (error) {
+    console.error('Error detecting anomalies:', error);
+    throw new Error('Failed to analyze X-ray image. Please try again.');
+  }
+};
+
+export const analyzeMedicalImage = async (detectedAnomalies: DetectedAnomaly[]): Promise<string> => {
+  try {
+    const modelInstance = genAI.getGenerativeModel({ model: 'gemini-pro' });
+
+    const anomaliesDescription = detectedAnomalies.map((anomaly, index) =>
+      `${index + 1}. Type: ${anomaly.type}\n   Location: ${anomaly.location}\n   Confidence: ${(anomaly.confidence * 100).toFixed(1)}%\n   Description: ${anomaly.description}`
+    ).join('\n\n');
+
+    const prompt = `As a medical AI assistant, provide a detailed analysis of the following X-ray findings:
+
+Detected Anomalies:
+${anomaliesDescription}
+
+Please provide:
+1. A comprehensive interpretation of these findings
+2. Possible differential diagnoses
+3. Recommended follow-up actions or additional tests
+4. Important considerations for the treating physician
+
+Keep the response professional, clear, and structured for medical professionals.`;
+
+    const result = await modelInstance.generateContent(prompt);
+    const response = await result.response;
+    return response.text();
+  } catch (error) {
+    console.error('Error analyzing with Gemini:', error);
+    throw new Error('Failed to generate AI analysis. Please try again.');
+  }
+};
